@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -33,6 +33,8 @@ import {
 } from "./issue-graph-liveness.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 
+const ISSUE_RECOVERY_RATE_WINDOW_MS = 5 * 60 * 1000;
+const ISSUE_RECOVERY_RATE_CAP = 5;
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_MIN_STALE_MS = 24 * 60 * 60 * 1000;
@@ -62,14 +64,7 @@ type RecoveryWakeup = (
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  | "id"
-  | "agentId"
-  | "status"
-  | "error"
-  | "errorCode"
-  | "contextSnapshot"
-  | "livenessState"
-  | "livenessReason"
+  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot"
 > | null;
 
 type WatchdogDecisionActor =
@@ -116,24 +111,6 @@ function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
   if (errorCode) return ` Latest retry failure: \`${errorCode}\`.`;
   if (summary) return ` Latest retry failure: ${summary}.`;
   return null;
-}
-
-function summarizeRunLivenessForIssueComment(run: LatestIssueRun) {
-  if (!run) return null;
-
-  const livenessState = readNonEmptyString(run.livenessState)?.trim() ?? null;
-  const livenessReason = readNonEmptyString(run.livenessReason)?.trim() ?? null;
-  if (livenessState && livenessReason) {
-    return ` Latest liveness: \`${livenessState}\` - ${livenessReason}.`;
-  }
-  if (livenessState) return ` Latest liveness: \`${livenessState}\`.`;
-  if (livenessReason) return ` Latest liveness: ${livenessReason}.`;
-  return null;
-}
-
-function isNonContinuableSuccessfulRun(run: LatestIssueRun) {
-  return run?.status === "succeeded" &&
-    (run.livenessState === "needs_followup" || run.livenessState === "blocked");
 }
 
 function didAutomaticRecoveryFail(
@@ -314,17 +291,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         error: heartbeatRuns.error,
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
-        livenessState: heartbeatRuns.livenessState,
-        livenessReason: heartbeatRuns.livenessReason,
       })
       .from(heartbeatRuns)
       .where(
         and(
           eq(heartbeatRuns.companyId, companyId),
-          or(
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-            sql`${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issueId}`,
-          ),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
@@ -361,6 +333,102 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ]);
 
     return Boolean(run || deferredWake);
+  }
+
+  async function countIssueRecoveryEnqueuesInWindow(
+    companyId: string,
+    agentId: string,
+    issueId: string,
+    windowMs: number,
+  ) {
+    const since = new Date(Date.now() - windowMs);
+    const [row] = await db
+      .select({ total: count() })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' IN ('assignment_recovery', 'issue_continuation_needed')`,
+          gt(heartbeatRuns.createdAt, since),
+        ),
+      );
+    return row?.total ?? 0;
+  }
+
+  async function tripIssueRecoveryRateLimit(input: {
+    issue: typeof issues.$inferSelect;
+    agentId: string;
+    latestRun: LatestIssueRun;
+    enqueueCount: number;
+  }) {
+    const windowMinutes = ISSUE_RECOVERY_RATE_WINDOW_MS / 60_000;
+    const comment =
+      `Paperclip detected a recovery loop: ${input.enqueueCount} recovery enqueues for this ` +
+      `issue in the last ${windowMinutes} minutes. ` +
+      "Moving the issue to `blocked` and pausing the agent to stop the loop.";
+
+    // Block the issue directly — skip the normal escalation path to avoid
+    // creating a recovery sub-issue (which would itself enqueue a wake and
+    // risk re-entering the loop). This is a hard stop: human intervention is
+    // required before either the issue or the agent can resume.
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: "blocked",
+    });
+
+    if (updated) {
+      await issuesSvc.addComment(
+        input.issue.id,
+        `${comment}\n\n- Recovery issue: none — rate-limit trip requires direct operator intervention.\n- Next action: inspect the recovery run history, fix the underlying cause, then unblock the issue and unpause the agent.`,
+        {},
+      );
+      await logActivity(db, {
+        companyId: input.issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: input.issue.id,
+        details: {
+          identifier: input.issue.identifier,
+          status: "blocked",
+          previousStatus: input.issue.status,
+          source: "recovery.per_issue_rate_limit",
+          enqueueCount: input.enqueueCount,
+          latestRunId: input.latestRun?.id ?? null,
+        },
+      });
+    }
+
+    const [pausedAgent] = await db
+      .update(agents)
+      .set({
+        status: "paused",
+        pauseReason: comment,
+        pausedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(agents.id, input.agentId),
+          notInArray(agents.status, ["paused", "terminated"]),
+        ),
+      )
+      .returning();
+    const auditRunId = input.latestRun?.id ?? input.issue.checkoutRunId ?? input.issue.executionRunId ?? null;
+    if (auditRunId) {
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId: input.issue.companyId,
+        runId: auditRunId,
+        evaluationIssueId: input.issue.id,
+        decision: "rate_limited",
+        reason: comment,
+      });
+    }
+    return { escalated: Boolean(updated), paused: Boolean(pausedAgent) };
   }
 
   async function enqueueStrandedIssueRecovery(input: {
@@ -1247,21 +1315,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       : "none";
     const retryReason = readNonEmptyString(parseObject(input.latestRun?.contextSnapshot)?.retryReason) ?? "unknown";
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
-    const livenessSummary = summarizeRunLivenessForIssueComment(input.latestRun);
 
     return [
-      "Paperclip escalated an assigned issue with no live execution path and created this explicit recovery task.",
+      "Paperclip exhausted automatic recovery for an assigned issue and created this explicit recovery task.",
       "",
       "## Source",
       "",
       `- Source issue: ${sourceIssue}`,
       `- Previous source status: \`${input.previousStatus}\``,
-      `- Latest relevant run: ${runLink}`,
-      `- Latest run status: \`${input.latestRun?.status ?? "unknown"}\``,
+      `- Latest retry run: ${runLink}`,
+      `- Latest retry status: \`${input.latestRun?.status ?? "unknown"}\``,
       `- Detected invariant: \`stranded_assigned_issue\``,
       `- Retry reason: \`${retryReason}\``,
       failureSummary ? `- Failure: ${failureSummary.trim()}` : "- Failure: none recorded",
-      livenessSummary ? `- Liveness: ${livenessSummary.trim()}` : "- Liveness: none recorded",
       "",
       "## Ownership",
       "",
@@ -1427,8 +1493,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         latestRunId: input.latestRun?.id ?? null,
         latestRunStatus: input.latestRun?.status ?? null,
         latestRunErrorCode: input.latestRun?.errorCode ?? null,
-        latestRunLivenessState: input.latestRun?.livenessState ?? null,
-        latestRunLivenessReason: input.latestRun?.livenessReason ?? null,
         recoveryIssueId: recoveryIssue?.id ?? null,
         blockerIssueIds: nextBlockerIds,
       },
@@ -1454,6 +1518,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       continuationRequeued: 0,
       orphanBlockersAssigned: 0,
       escalated: 0,
+      rateLimitTripped: 0,
       skipped: 0,
       issueIds: [] as string[],
     };
@@ -1508,6 +1573,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        const assignmentEnqueueCount = await countIssueRecoveryEnqueuesInWindow(
+          issue.companyId,
+          agentId,
+          issue.id,
+          ISSUE_RECOVERY_RATE_WINDOW_MS,
+        );
+        if (assignmentEnqueueCount >= ISSUE_RECOVERY_RATE_CAP) {
+          const { escalated: didEscalate } = await tripIssueRecoveryRateLimit({
+            issue,
+            agentId,
+            latestRun,
+            enqueueCount: assignmentEnqueueCount,
+          });
+          if (didEscalate) {
+            result.rateLimitTripped += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
         const queued = await enqueueStrandedIssueRecovery({
           issueId: issue.id,
           agentId,
@@ -1529,25 +1616,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.skipped += 1;
         continue;
       }
-      if (isNonContinuableSuccessfulRun(latestRun)) {
-        const livenessSummary = summarizeRunLivenessForIssueComment(latestRun);
-        const updated = await escalateStrandedAssignedIssue({
-          issue,
-          previousStatus: "in_progress",
-          latestRun,
-          comment:
-            "Paperclip stopped automatic continuation because the latest successful run requires manual follow-up " +
-            `or has declared a blocker, and this assigned \`in_progress\` issue has no live execution path.${livenessSummary ?? ""} ` +
-            "Moving it to `blocked` so it is visible for intervention.",
-        });
-        if (updated) {
-          result.escalated += 1;
-          result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
-        }
-        continue;
-      }
       if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
         const failureSummary = summarizeRunFailureForIssueComment(latestRun);
         const updated = await escalateStrandedAssignedIssue({
@@ -1561,6 +1629,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         });
         if (updated) {
           result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+
+      const continuationEnqueueCount = await countIssueRecoveryEnqueuesInWindow(
+        issue.companyId,
+        agentId,
+        issue.id,
+        ISSUE_RECOVERY_RATE_WINDOW_MS,
+      );
+      if (continuationEnqueueCount >= ISSUE_RECOVERY_RATE_CAP) {
+        const { escalated: didEscalate } = await tripIssueRecoveryRateLimit({
+          issue,
+          agentId,
+          latestRun,
+          enqueueCount: continuationEnqueueCount,
+        });
+        if (didEscalate) {
+          result.rateLimitTripped += 1;
           result.issueIds.push(issue.id);
         } else {
           result.skipped += 1;

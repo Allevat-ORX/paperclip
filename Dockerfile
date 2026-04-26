@@ -4,7 +4,6 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 \
-  && pip3 install --break-system-packages git+https://github.com/NousResearch/hermes-agent.git \
   && rm -rf /var/lib/apt/lists/* \
   && corepack enable
 
