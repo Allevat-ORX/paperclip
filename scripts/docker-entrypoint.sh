@@ -26,4 +26,10 @@ if [ "$changed" = "1" ]; then
     chown -R node:node /paperclip
 fi
 
+# Restore Gemini OAuth credentials from persistent volume
+if [ -d /paperclip/.gemini ]; then
+    cp -r /paperclip/.gemini /home/node/.gemini
+    chown -R node:node /home/node/.gemini
+    echo "Gemini OAuth credentials restored from volume"
+fi
 exec gosu node "$@"
