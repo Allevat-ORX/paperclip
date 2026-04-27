@@ -26,6 +26,14 @@ if [ "$changed" = "1" ]; then
     chown -R node:node /paperclip
 fi
 
+# Restore Claude Code credentials from persistent volume
+if [ -f /paperclip/.claude/.credentials.json ]; then
+    mkdir -p /home/node/.claude
+    cp /paperclip/.claude/.credentials.json /home/node/.claude/.credentials.json
+    chown -R node:node /home/node/.claude
+    echo "Claude Code credentials restored from volume"
+fi
+
 # Restore Gemini OAuth credentials from persistent volume
 if [ -d /paperclip/.gemini ]; then
     cp -r /paperclip/.gemini /home/node/.gemini
