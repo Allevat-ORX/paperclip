@@ -29,6 +29,16 @@ services:
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "private"
       PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:-http://localhost:3100}"
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      OPENCODE_ALLOW_ALL_MODELS: "true"
+      OLLAMA_HOST: "http://172.17.0.1:11434"
+      GEMINI_CLI_TRUST_WORKSPACE: "true"
+      GH_TOKEN: "${GH_TOKEN:-}"
+      JIRA_EMAIL: "${JIRA_EMAIL:-}"
+      JIRA_TOKEN: "${JIRA_TOKEN:-}"
+      JIRA_BASE: "${JIRA_BASE:-}"
     volumes:
       - paperclip-data:/paperclip
     depends_on:
